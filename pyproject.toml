@@ -1,0 +1,11 @@
+[project]
+name = "hr-policy-chatbot"
+version = "0.1.0"
+description = "Internal HR Policy Chatbot — answers employee questions about company policies"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi[standard]>=0.140.0",
+    "langchain>=1.3.14",
+    "langchain-google-genai>=4.3.1",
+]
