@@ -13,4 +13,13 @@ wheels/
 .env
 .env.*
 !.env.example
+
+# Runtime data
+data/
+uploads/
+
+# Implementation / progress plan PDFs and their generators (local only)
 HR_Policy_Chatbot_Implementation_Plan.pdf
+HR_Policy_Chatbot_Progress_and_Next_Steps.pdf
+scripts/generate_implementation_plan_pdf.py
+scripts/generate_progress_pdf.py

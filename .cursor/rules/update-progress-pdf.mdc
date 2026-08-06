@@ -1,0 +1,38 @@
+---
+description: Keep the Progress & Next Steps PDF updated whenever project status changes
+alwaysApply: true
+---
+
+# Living Progress PDF
+
+Whenever you complete meaningful project work (features, fixes, blockers discovered, setup milestones, test status changes, architecture decisions), **update and regenerate** the progress brief before ending the turn.
+
+## What to update
+
+1. Edit `scripts/generate_progress_pdf.py` so the STATUS / BLOCKERS / NEXT / phase table / executive summary reflect reality (code vs live/ops).
+2. Regenerate the PDF:
+
+```bash
+uv run python scripts/generate_progress_pdf.py
+```
+
+Output file: `HR_Policy_Chatbot_Progress_and_Next_Steps.pdf`
+
+## When this applies
+
+- New capabilities shipped or marked Done/Partial/Todo
+- Runtime findings (e.g. empty Qdrant collection, migrate not run)
+- Blockers resolved or new blockers found
+- Roadmap priority changes
+- Test counts or known risks change
+
+## When to skip
+
+- Typos, comment-only edits, or tiny refactors with no status impact
+- User explicitly says not to touch the PDF
+
+## Notes
+
+- Prefer this PDF over the Implementation Plan PDF for “what’s done now” — the plan’s Phase checklist can be stale.
+- Do not invent live verification; distinguish **code ready** from **live/ops verified**.
+- Keep secrets out of the PDF (no API keys).

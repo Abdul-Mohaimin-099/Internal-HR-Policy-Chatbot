@@ -2,7 +2,7 @@
 
 ## Status
 
-Proposed
+Accepted
 
 ## Context
 
@@ -13,11 +13,12 @@ queryable and auditable independently of the raw conversation history.
 ## Decision
 
 Policy responses will be stored in a dedicated table/collection, separate from
-the LangGraph checkpoint store.
+the LangGraph checkpoint store. Clean Human/AI text lives in ``messages``;
+structured decisions live in ``audit_logs``.
 
 ## Consequences
 
 - Policy responses can be queried, reported on, and audited without deserializing
   checkpoint blobs.
 - The checkpoint store remains a pure conversation-state concern.
-- A thin mapping (thread_id → policy_response_id) links the two.
+- A thin mapping (thread_id → conversation / messages) links the two.

@@ -1,0 +1,53 @@
+# Local development stack: FastAPI app + PostgreSQL.
+# Qdrant is expected as Qdrant Cloud (see QDRANT_URL in .env); add a local
+# qdrant service below if you prefer fully offline development.
+#
+# Usage:
+#   docker compose up -d postgres
+#   uv run alembic upgrade head
+#   uv run uvicorn hr_chatbot.main:app --reload
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: hr
+      POSTGRES_PASSWORD: hr
+      POSTGRES_DB: hr_chatbot
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hr -d hr_chatbot"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Optional local Qdrant — uncomment if not using Qdrant Cloud.
+  # qdrant:
+  #   image: qdrant/qdrant:latest
+  #   ports:
+  #     - "6333:6333"
+  #   volumes:
+  #     - qdrantdata:/qdrant/storage
+
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://hr:hr@postgres:5432/hr_chatbot
+      DATABASE_URL_SYNC: postgresql+psycopg://hr:hr@postgres:5432/hr_chatbot
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./data:/app/data
+      - ./docs/policies:/app/docs/policies:ro
+
+volumes:
+  pgdata:
+  # qdrantdata:
