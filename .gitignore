@@ -21,5 +21,7 @@ uploads/
 # Implementation / progress plan PDFs and their generators (local only)
 HR_Policy_Chatbot_Implementation_Plan.pdf
 HR_Policy_Chatbot_Progress_and_Next_Steps.pdf
+HR_Policy_Chatbot_Internal_Process_and_Test_Plan.pdf
 scripts/generate_implementation_plan_pdf.py
 scripts/generate_progress_pdf.py
+generate_internal_process_and_test_plan_pdf.py
