@@ -4,7 +4,7 @@ Why this endpoint
 -----------------
 This is the employee-facing entry point (plan §6). It compiles the graph with
 an in-memory checkpointer by default (swap in Postgres via ``checkpointer.py``
-when the DB is available), invokes triage→retrieve|escalate, and returns
+when the DB is available), invokes triage→policy_answer|escalate, and returns
 reply + sources + escalation status in one response.
 """
 
@@ -29,7 +29,12 @@ _compiled = policy_chat_graph.compile_graph(checkpointer=memory_checkpointer())
 
 @router.post("/chat", response_model=ChatResponse)
 async def chat(body: ChatRequest) -> ChatResponse:
-    """Run one turn of the policy-chat graph for ``body.thread_id``."""
+    """Run one turn of the policy-chat graph for ``body.thread_id``.
+
+    Response includes two forms of the answer:
+    - ``text`` / ``reply`` — simple string
+    - ``json`` — structured payload (sources, triage, escalation, ids)
+    """
     state = {
         "user_input": body.user_input,
         "thread_id": body.thread_id,
@@ -47,7 +52,7 @@ async def chat(body: ChatRequest) -> ChatResponse:
             detail=f"Policy chat workflow failed: {exc}",
         ) from exc
 
-    return ChatResponse(
+    return ChatResponse.from_turn(
         reply=result.get("reply") or "",
         sources=result.get("sources") or [],
         escalated=bool(result.get("escalated")),

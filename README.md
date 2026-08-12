@@ -58,13 +58,14 @@ technology, HSE, compensation).
                                                   │
                                    ┌──────────────▼───────────────────────┐
                                    │  LangGraph policy_chat workflow      │
-                                   │  triage → retrieve|escalate → persist│
+                                   │  triage → answer|escalate → persist  │
+                                   │  (subagents + tools; fixed routing)  │
                                    └──────┬───────────────┬───────────────┘
                                           │               │
                     ┌─────────────────────▼──┐   ┌────────▼────────────┐
                     │  Google Gemini         │   │  PostgreSQL 16      │
                     │  Flash-Lite (triage /  │   │  users, conversations│
-                    │  respond) + fallbacks  │   │  messages, docs,     │
+                    │  agents) + fallbacks   │   │  messages, docs,     │
                     │  gemini-embedding-2    │   │  escalations, audit  │
                     └───────────┬────────────┘   └─────────────────────┘
                                 │
@@ -86,7 +87,9 @@ Short-term multi-turn memory uses a LangGraph checkpointer keyed by
 
 ## Chat workflow
 
-Every `POST /api/v1/chat` turn runs the same LangGraph path:
+Every `POST /api/v1/chat` turn runs the same LangGraph path. Routing stays
+deterministic (structured triage + conditional edges); safe/sensitive work is
+done by tool-using subagents (`langchain.agents.create_agent`):
 
 ```
 START
@@ -97,10 +100,7 @@ triage  (Gemini Flash-Lite + structured TriageResult)
   ├── sensitivity ≠ high AND needs_human = false
   │     │
   │     ▼
-  │   retrieve  (embed query → Qdrant top-k, score ≥ threshold)
-  │     │
-  │     ▼
-  │   respond   (Gemini + YAML prompt + cited context)
+  │   policy_answer  (subagent + rag_search RAG tool → grounded reply)
   │     │
   │     ▼
   │   persist   (conversation + messages + audit)
@@ -111,7 +111,7 @@ triage  (Gemini Flash-Lite + structured TriageResult)
   └── sensitivity = high OR needs_human = true
         │
         ▼
-      escalate  (open ticket + safe refusal reply)
+      escalate  (subagent + create_escalation_ticket tool → safe refusal)
         │
         ▼
       persist
@@ -125,9 +125,8 @@ triage  (Gemini Flash-Lite + structured TriageResult)
 | Node | Role |
 |---|---|
 | **triage** | Closed-set category (`leave`, `benefits`, `remote_work`, `payroll`, `expenses`, `conduct`, `termination`, `medical`, `general`), sensitivity (`low` / `medium` / `high`), `needs_human`, confidence |
-| **retrieve** | Embeds the question; pulls top-k chunks from Qdrant with payload metadata (filename, section, page) |
-| **respond** | Grounds the reply in retrieved excerpts; returns `reply` + `sources` |
-| **escalate** | Creates an open escalation; returns a fixed safe refusal (no automated advice on sensitive topics) |
+| **policy_answer** | Tool-using subagent: calls `rag_search` (RAG: embed → Qdrant top-k) then drafts a grounded reply with `sources` |
+| **escalate** | Tool-using subagent: calls `create_escalation_ticket`, returns a fixed safe refusal (no automated advice on sensitive topics) |
 | **persist** | Upserts user/conversation; writes Human + AI messages; records audit metadata |
 
 ### Multi-turn conversations
@@ -151,11 +150,13 @@ sequenceDiagram
     API->>G: ainvoke(state, thread_id)
     G->>LLM: triage (structured)
     alt safe
-        G->>Q: vector search
-        Q-->>G: chunks + citation payload
-        G->>LLM: respond with context
+        G->>LLM: policy_answer subagent
+        LLM->>Q: rag_search tool
+        Q-->>LLM: chunks + citation payload
+        LLM-->>G: grounded reply + sources
     else sensitive
-        G->>DB: create escalation
+        G->>LLM: escalate subagent
+        LLM->>DB: create_escalation_ticket tool
     end
     G->>DB: persist messages + audit
     G-->>API: reply, sources, escalated
@@ -194,14 +195,24 @@ without re-uploading.
 
 ---
 
-## Escalation workflow
+## Escalation workflow (human-in-the-loop)
+
+Chat completes in one turn with a safe refusal. HR takes action afterward via
+the escalations API (ticket-queue HITL — not a LangGraph interrupt).
 
 1. Triage marks the turn sensitive / needing a human.
-2. Escalate node opens a row in `escalations` (`status=open`) and returns a
-   safe refusal to the employee.
+2. Escalate opens a row in `escalations` (`status=open`) and returns a safe
+   refusal to the employee.
 3. HR lists open cases via `GET /api/v1/escalations`.
-4. HR closes a case via `POST /api/v1/escalations/{id}/resolve` with
-   `resolved_by`.
+4. HR opens a case via `GET /api/v1/escalations/{id}` (ticket + conversation
+   messages + `thread_id` / `employee_id`).
+5. HR posts a human reply via `POST /api/v1/escalations/{id}/respond`
+   (`responded_by`, `message`) — writes a `role=hr` message; ticket stays open.
+6. HR closes via `POST /api/v1/escalations/{id}/resolve` with `resolved_by` and
+   optional `hr_message` (final reply written into the conversation before close).
+
+Employee clients can show HR replies by polling
+`GET /api/v1/conversations/{user_id}` (messages with `role: "hr"`).
 
 ---
 
@@ -361,7 +372,9 @@ x-api-key: <PROJECT_API_KEY>
 | `POST` | `/api/v1/documents/reindex` | Rebuild vectors (one doc or all) |
 | `GET` | `/api/v1/conversations/{user_id}` | Conversation history for a user UUID |
 | `GET` | `/api/v1/escalations` | List escalations (`?status=open` default) |
-| `POST` | `/api/v1/escalations/{id}/resolve` | Mark escalation handled |
+| `GET` | `/api/v1/escalations/{id}` | Ticket detail + conversation for HR review |
+| `POST` | `/api/v1/escalations/{id}/respond` | HR human reply (ticket stays open) |
+| `POST` | `/api/v1/escalations/{id}/resolve` | Resolve; optional `hr_message` final reply |
 
 Legacy alias (hidden from OpenAPI): `POST /api/v1/policy-chat/chatbot` → same as `/chat`.
 
@@ -385,12 +398,22 @@ Legacy alias (hidden from OpenAPI): `POST /api/v1/policy-chat/chatbot` → same 
 | `employee_id` | no | Defaults to `anonymous` |
 | `user_id` | no | Optional known user UUID |
 
-**Response**
+**Response** (two forms of the answer)
 
 ```json
 {
+  "text": "…",
+  "json": {
+    "reply": "…",
+    "sources": [{ "filename": "…", "section": "…", "page": 1, "score": 0.72 }],
+    "escalated": false,
+    "escalation_id": null,
+    "triage": { "category": "leave", "sensitivity": "low", "needs_human": false, "confidence": 0.9 },
+    "conversation_id": "…",
+    "thread_id": "t1"
+  },
   "reply": "…",
-  "sources": [{ "filename": "…", "section": "…", "page_number": 1, "score": 0.72 }],
+  "sources": [{ "filename": "…", "section": "…", "page": 1, "score": 0.72 }],
   "escalated": false,
   "escalation_id": null,
   "triage": { "category": "leave", "sensitivity": "low", "needs_human": false, "confidence": 0.9 },
@@ -398,6 +421,13 @@ Legacy alias (hidden from OpenAPI): `POST /api/v1/policy-chat/chatbot` → same 
   "thread_id": "t1"
 }
 ```
+
+| Field | Form | Notes |
+|---|---|---|
+| `text` | simple string | Display-ready assistant reply |
+| `json` | structured object | Full turn: `reply`, `sources`, `escalated`, `triage`, ids |
+| `reply` | simple string | Same as `text` (backward compatible) |
+| other top-level fields | structured | Same values as `json.*` for older clients |
 
 ### Examples
 
@@ -436,13 +466,29 @@ curl http://localhost:8000/api/v1/escalations?status=open \
   -H "x-api-key: changeme"
 ```
 
-**Resolve an escalation**
+**Review one escalation (HITL context)**
+
+```bash
+curl http://localhost:8000/api/v1/escalations/<escalation-uuid> \
+  -H "x-api-key: changeme"
+```
+
+**HR reply (keep ticket open)**
+
+```bash
+curl -X POST http://localhost:8000/api/v1/escalations/<escalation-uuid>/respond \
+  -H "x-api-key: changeme" \
+  -H "Content-Type: application/json" \
+  -d "{\"responded_by\":\"hr.jane\",\"message\":\"Thanks — an HR specialist will contact you today.\"}"
+```
+
+**Resolve an escalation (optional final HR message)**
 
 ```bash
 curl -X POST http://localhost:8000/api/v1/escalations/<escalation-uuid>/resolve \
   -H "x-api-key: changeme" \
   -H "Content-Type: application/json" \
-  -d "{\"resolved_by\":\"hr.jane\"}"
+  -d "{\"resolved_by\":\"hr.jane\",\"hr_message\":\"Case closed after specialist follow-up.\"}"
 ```
 
 ---
@@ -486,12 +532,14 @@ Avoid overloaded synonyms like “ticket/issue” for the employee question, or
 │   │   ├── models.py             # LLM helpers + fallbacks
 │   │   ├── checkpointer.py       # Conversation memory
 │   │   └── workflows/policy_chat/
-│   │       ├── graph.py          # StateGraph wiring
-│   │       ├── nodes.py          # triage / retrieve / respond / escalate / persist
+│   │       ├── graph.py          # StateGraph wiring (deterministic routing)
+│   │       ├── agents.py         # policy_answer + escalation subagents
+│   │       ├── tools.py          # rag_search / create_escalation_ticket
+│   │       ├── nodes.py          # triage / policy_answer / escalate / persist
 │   │       └── state.py          # PolicyChatState + TriageResult
 │   ├── services/                 # escalation + audit helpers
 │   └── api/v1/                   # versioned REST endpoints + schemas
-├── tests/                        # pytest (auth, triage routing, LLM fallbacks)
+├── tests/                        # pytest (auth, triage routing, tools, LLM fallbacks)
 ├── docker-compose.yml
 ├── Dockerfile
 ├── pyproject.toml
@@ -513,7 +561,9 @@ uv run pytest
 Current unit coverage focuses on:
 
 - API key auth (`tests/unit/test_api_auth.py`)
-- Triage → retrieve / escalate routing (`tests/unit/test_triage_routing.py`)
+- Triage → policy_answer / escalate routing (`tests/unit/test_triage_routing.py`)
+- Policy-chat tools (`tests/unit/test_policy_chat_tools.py`)
+- Escalation HITL schemas / auth gates (`tests/unit/test_escalation_hitl.py`)
 - LLM fallback chain (`tests/unit/test_llm_fallbacks.py`)
 
 Dev tools (pytest, ruff) are in the `dev` dependency group (`uv sync` installs them).

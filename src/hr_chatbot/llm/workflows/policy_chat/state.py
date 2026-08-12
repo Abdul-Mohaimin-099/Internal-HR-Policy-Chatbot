@@ -63,13 +63,13 @@ class PolicyChatState(TypedDict, total=False):
 
     # Filled by triage node.
     triage: dict[str, Any]
-    # Filled by retrieve node — list of chunk dicts for the respond prompt.
+    # Filled by policy_answer subagent (rag_search tool) — chunk dicts.
     retrieved_chunks: list[dict[str, Any]]
-    # Final employee-facing reply (respond or escalate path).
+    # Final employee-facing reply (policy_answer or escalate path).
     reply: str
     # Citation payloads returned to the API client.
     sources: list[dict[str, Any]]
-    # True when the escalate node ran.
+    # True when the escalate subagent / ticket tool ran.
     escalated: bool
     escalation_id: str | None
     # DB ids filled by persist node.

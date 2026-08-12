@@ -5,6 +5,10 @@ Why a class-based graph
 Keeps node/edge registration in one place, exposes ``compile_graph(checkpointer)``
 so HTTP handlers can attach the Postgres checkpointer per process while tests
 can compile with ``MemorySaver``.
+
+Routing stays deterministic (structured triage + conditional edges). The
+``policy_answer`` and ``escalate`` nodes invoke tool-using subagents; they do
+not freely choose escalate vs RAG.
 """
 
 from __future__ import annotations
@@ -16,8 +20,7 @@ from langgraph.graph.state import CompiledStateGraph
 from hr_chatbot.llm.workflows.policy_chat.nodes import (
     escalate_node,
     persist_node,
-    respond_node,
-    retrieve_node,
+    policy_answer_node,
     route_after_triage,
     triage_node,
 )
@@ -25,35 +28,33 @@ from hr_chatbot.llm.workflows.policy_chat.state import PolicyChatState
 
 
 class PolicyChatGraph(StateGraph):
-    """Full triage → retrieve/respond | escalate → persist workflow."""
+    """Full triage → policy_answer | escalate → persist workflow."""
 
     def __init__(self) -> None:
         super().__init__(PolicyChatState)
 
         # Register nodes — each name is what conditional edges return.
         self.add_node("triage", triage_node)
-        self.add_node("retrieve", retrieve_node)
-        self.add_node("respond", respond_node)
+        self.add_node("policy_answer", policy_answer_node)
         self.add_node("escalate", escalate_node)
         self.add_node("persist", persist_node)
 
         # Linear entry: every request starts with classification.
         self.add_edge(START, "triage")
 
-        # Branch on triage result (safe → RAG path, sensitive → escalate).
+        # Branch on triage result (safe → RAG subagent, sensitive → escalate).
         self.add_conditional_edges(
             "triage",
             route_after_triage,
             {
-                "retrieve": "retrieve",
+                "policy_answer": "policy_answer",
                 "escalate": "escalate",
             },
         )
 
-        # Safe path: search then draft grounded answer.
-        self.add_edge("retrieve", "respond")
-        self.add_edge("respond", "persist")
-        # Sensitive path: ticket + safe refusal, then same persist step.
+        # Safe path: tool-using policy subagent, then persist.
+        self.add_edge("policy_answer", "persist")
+        # Sensitive path: ticket tool + safe refusal, then same persist step.
         self.add_edge("escalate", "persist")
         self.add_edge("persist", END)
 

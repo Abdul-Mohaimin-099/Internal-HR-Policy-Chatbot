@@ -3,8 +3,9 @@
 Why this exists
 ---------------
 Harassment, termination, and medical topics must never get automated advice
-(plan §4 / §13). Instead we create an Escalation row HR can list and resolve,
-and return a safe acknowledgment to the employee.
+(plan §4 / §13). Instead we create an Escalation row, return a safe
+acknowledgment to the employee, and let HR take human-in-the-loop action
+(inspect context, reply, resolve) via the escalations API.
 """
 
 from __future__ import annotations

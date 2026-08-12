@@ -39,7 +39,7 @@ def test_route_after_triage_escalates_when_needs_human():
     assert nxt == "escalate"
 
 
-def test_route_after_triage_safe_goes_to_retrieve():
+def test_route_after_triage_safe_goes_to_policy_answer():
     nxt = route_after_triage(
         {
             "user_input": "How many sick days?",
@@ -52,7 +52,7 @@ def test_route_after_triage_safe_goes_to_retrieve():
             },
         }
     )
-    assert nxt == "retrieve"
+    assert nxt == "policy_answer"
 
 
 def test_chunk_text_produces_overlapping_chunks():

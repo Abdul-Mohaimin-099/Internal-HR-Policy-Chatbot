@@ -65,7 +65,7 @@ class Message(Base):
     conversation_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("conversations.id"), index=True
     )
-    # ``user`` | ``assistant`` | ``system``
+    # ``user`` | ``assistant`` | ``system`` | ``hr`` (human-in-the-loop reply)
     role: Mapped[str] = mapped_column(String(32))
     content: Mapped[str] = mapped_column(Text)
     # List of {filename, section, page, score} dicts when the reply was RAG-grounded.

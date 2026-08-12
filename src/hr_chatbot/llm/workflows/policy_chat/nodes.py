@@ -2,42 +2,41 @@
 
 Topology
 --------
-START → triage → (safe) retrieve → respond → persist → END
+START → triage → (safe) policy_answer → persist → END
                ↘ (sensitive) escalate ──────↗
 
-Each async function is a graph node: it receives ``PolicyChatState``, performs
-one concern (classify / search / draft / ticket / save), and returns a partial
-state update that LangGraph merges in.
+``policy_answer`` and ``escalate`` are thin wrappers around tool-using
+subagents (``create_agent``). Structured triage + conditional edges still own
+routing so high-sensitivity queries never reach RAG.
 """
 
 from __future__ import annotations
 
-import uuid
+import json
 from typing import Any
 
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
-from sqlalchemy import select
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
 from hr_chatbot.core.config import settings
 from hr_chatbot.core.database import AsyncSessionLocal
 from hr_chatbot.core.logging_config import get_logger
-from hr_chatbot.llm.models import get_chat_llm, get_structured_llm, model_used_label
+from hr_chatbot.llm.models import get_structured_llm, model_used_label
 from hr_chatbot.llm.prompts import load_prompt
+from hr_chatbot.llm.workflows.policy_chat.agents import (
+    ESCALATION_REPLY,
+    get_escalation_agent,
+    get_policy_answer_agent,
+)
+from hr_chatbot.llm.workflows.policy_chat.helpers import ensure_conversation, ensure_user
 from hr_chatbot.llm.workflows.policy_chat.state import PolicyChatState, TriageResult
-from hr_chatbot.models.conversation import Conversation, Message
-from hr_chatbot.models.user import User
-from hr_chatbot.rag.retriever import search
-from hr_chatbot.services import audit_service, escalation_service
+from hr_chatbot.llm.workflows.policy_chat.tools import (
+    create_escalation_ticket,
+    rag_search,
+)
+from hr_chatbot.models.conversation import Message
+from hr_chatbot.services import audit_service
 
 logger = get_logger(__name__)
-
-# Safe copy shown when we refuse automated advice (plan §13).
-_ESCALATION_REPLY = (
-    "This question needs a human HR specialist. I've created a review request "
-    "for the HR team, and someone will follow up with you. I can't provide "
-    "automated guidance on sensitive topics like harassment, termination, or "
-    "medical matters."
-)
 
 
 def _history_text(state: PolicyChatState, limit: int = 6) -> str:
@@ -51,21 +50,41 @@ def _history_text(state: PolicyChatState, limit: int = 6) -> str:
     return "\n".join(lines) if lines else "(none)"
 
 
-def _format_context(chunks: list[dict[str, Any]]) -> str:
-    """Turn retrieved chunk dicts into a numbered context block for Gemini Pro."""
-    if not chunks:
-        return "(no relevant policy excerpts retrieved)"
-    parts: list[str] = []
-    for i, c in enumerate(chunks, start=1):
-        cite = f"{c.get('filename', '?')}"
-        if c.get("section"):
-            cite += f" | section: {c['section']}"
-        if c.get("page_number") is not None:
-            cite += f" | page: {c['page_number']}"
-        parts.append(
-            f"[{i}] ({cite}, score={c.get('score', 0):.3f})\n{c.get('text', '')}"
-        )
-    return "\n\n".join(parts)
+def _message_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    return str(content)
+
+
+def _last_ai_text(messages: list[Any]) -> str:
+    """Final non-tool-call AI message content from a subagent run."""
+    for m in reversed(messages):
+        if not isinstance(m, AIMessage):
+            continue
+        if getattr(m, "tool_calls", None):
+            continue
+        text = _message_text(m.content).strip()
+        if text:
+            return text
+    return ""
+
+
+def _tool_json_payloads(messages: list[Any], tool_name: str) -> list[dict[str, Any]]:
+    """Parse JSON bodies from ToolMessages for ``tool_name``."""
+    out: list[dict[str, Any]] = []
+    for m in messages:
+        if not isinstance(m, ToolMessage):
+            continue
+        name = getattr(m, "name", None) or ""
+        if name and name != tool_name:
+            continue
+        try:
+            data = json.loads(_message_text(m.content))
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if isinstance(data, dict):
+            out.append(data)
+    return out
 
 
 async def triage_node(state: PolicyChatState) -> dict[str, Any]:
@@ -76,7 +95,6 @@ async def triage_node(state: PolicyChatState) -> dict[str, Any]:
     if the primary model ID fails (quota / allow-list / outage).
     """
     prompt = load_prompt("triage")
-    # Structured output is applied per candidate inside get_structured_llm.
     structured = get_structured_llm(
         TriageResult,
         model=settings.TRIAGE_MODEL,
@@ -105,61 +123,45 @@ async def triage_node(state: PolicyChatState) -> dict[str, Any]:
     }
 
 
-async def retrieve_node(state: PolicyChatState) -> dict[str, Any]:
-    """Embed the question (gemini-embedding-2) and fetch top-k Qdrant chunks.
+async def policy_answer_node(state: PolicyChatState) -> dict[str, Any]:
+    """Run the policy-answer subagent (RAG tool: ``rag_search``).
 
-    Why a dedicated node: retrieval is I/O-bound and independent of generation;
-    isolating it makes LangSmith traces show search latency separately.
+    Isolating retrieval+generation in a ReAct-style agent keeps LangSmith traces
+    tool-aware while the parent graph still owns escalate vs answer routing.
     """
-    hits = search(state["user_input"])
-    chunks = [
-        {
-            "text": h.text,
-            "score": h.score,
-            "document_id": h.document_id,
-            "filename": h.filename,
-            "section": h.section,
-            "page_number": h.page_number,
-            "chunk_index": h.chunk_index,
-        }
-        for h in hits
-    ]
-    logger.info("Retrieved %s chunks for thread=%s", len(chunks), state.get("thread_id"))
-    return {"retrieved_chunks": chunks}
-
-
-async def respond_node(state: PolicyChatState) -> dict[str, Any]:
-    """Draft a grounded answer with Gemini Flash-Lite using retrieved context.
-
-    Flash-Lite keeps answer latency/cost low for routine policy Q&A; the
-    fallback chain covers primary-model failures without dropping the request.
-    """
-    prompt = load_prompt("response")
-    chunks = state.get("retrieved_chunks") or []
-    llm = get_chat_llm(model=settings.RESPONSE_MODEL, temperature=0.2)
-    user_text = prompt["user_template"].format(
-        question=state["user_input"],
-        context=_format_context(chunks),
+    agent = get_policy_answer_agent()
+    result = await agent.ainvoke(
+        {"messages": [{"role": "user", "content": state["user_input"]}]}
     )
-    ai = await llm.ainvoke(
-        [
-            SystemMessage(content=prompt["system"]),
-            HumanMessage(content=user_text),
-        ]
-    )
-    reply = ai.content if isinstance(ai.content, str) else str(ai.content)
-    sources = [
-        {
-            "filename": c.get("filename"),
-            "section": c.get("section"),
-            "page": c.get("page_number"),
-            "score": c.get("score"),
-        }
-        for c in chunks
-    ]
+    messages = result.get("messages") or []
+
+    chunks: list[dict[str, Any]] = []
+    sources: list[dict[str, Any]] = []
+    # Accept current tool name and the previous alias if present in traces.
+    for tool_name in ("rag_search", "search_policies"):
+        for payload in _tool_json_payloads(messages, tool_name):
+            chunks = payload.get("chunks") or chunks
+            sources = payload.get("sources") or sources
+
+    # Preserve retrieval even if the model skipped the RAG tool call.
+    if not chunks and not sources:
+        logger.warning("policy_answer agent skipped rag_search; invoking RAG tool directly")
+        raw = rag_search.invoke(state["user_input"])
+        payload = json.loads(raw)
+        chunks = payload.get("chunks") or []
+        sources = payload.get("sources") or []
+
+    reply = _last_ai_text(messages)
+    if not reply:
+        reply = (
+            "I couldn't find enough policy evidence to answer confidently. "
+            "Please contact HR for guidance."
+        )
+
     return {
         "reply": reply,
         "sources": sources,
+        "retrieved_chunks": chunks,
         "escalated": False,
         "escalation_id": None,
         "messages": [AIMessage(content=reply)],
@@ -167,38 +169,58 @@ async def respond_node(state: PolicyChatState) -> dict[str, Any]:
 
 
 async def escalate_node(state: PolicyChatState) -> dict[str, Any]:
-    """Create an HR escalation ticket and return a safe refusal (no RAG advice).
+    """Run the escalation subagent (tool: ``create_escalation_ticket``).
 
-    Why we skip retrieve/respond: plan §4 auto-escalation rule — high-sensitivity
-    topics must never receive automated policy interpretation.
+    Why we skip policy_answer: plan §4 auto-escalation rule — high-sensitivity
+    topics must never receive automated policy interpretation. The employee-facing
+    reply is the fixed safe refusal, not a free-form model paraphrase.
     """
     triage = state.get("triage") or {}
-    async with AsyncSessionLocal() as session:
-        user = await _ensure_user(session, state)
-        conversation = await _ensure_conversation(session, state, user.id)
-        esc = await escalation_service.create_escalation(
-            session,
-            conversation_id=conversation.id,
-            user_id=user.id,
-            category=str(triage.get("category", "general")),
-            reason=str(triage.get("reasoning", "High-sensitivity query")),
-        )
-        await audit_service.write_audit(
-            session,
-            conversation_id=conversation.id,
-            event_type="escalate",
-            triage_result=triage,
-            model_used=model_used_label(settings.TRIAGE_MODEL),
-        )
+    employee_id = state.get("employee_id") or "anonymous"
+    thread_id = state.get("thread_id") or ""
+    user_id = state.get("user_id") or ""
+    category = str(triage.get("category", "general"))
+    reason = str(triage.get("reasoning", "High-sensitivity query"))
 
-    reply = _ESCALATION_REPLY
+    agent = get_escalation_agent()
+    user_msg = (
+        f"category={category}\n"
+        f"reason={reason}\n"
+        f"employee_id={employee_id}\n"
+        f"thread_id={thread_id}\n"
+        f"user_id={user_id}\n"
+    )
+    result = await agent.ainvoke({"messages": [{"role": "user", "content": user_msg}]})
+    messages = result.get("messages") or []
+
+    escalation_id: str | None = None
+    conversation_id: str | None = None
+    for payload in _tool_json_payloads(messages, "create_escalation_ticket"):
+        escalation_id = payload.get("escalation_id") or escalation_id
+        conversation_id = payload.get("conversation_id") or conversation_id
+
+    if not escalation_id:
+        logger.warning("escalation agent skipped create_escalation_ticket; invoking tool directly")
+        raw = await create_escalation_ticket.ainvoke(
+            {
+                "category": category,
+                "reason": reason,
+                "employee_id": employee_id,
+                "thread_id": thread_id,
+                "user_id": user_id,
+            }
+        )
+        payload = json.loads(raw)
+        escalation_id = payload.get("escalation_id")
+        conversation_id = payload.get("conversation_id")
+
     return {
-        "reply": reply,
+        "reply": ESCALATION_REPLY,
         "sources": [],
         "escalated": True,
-        "escalation_id": str(esc.id),
-        "conversation_id": str(conversation.id),
-        "messages": [AIMessage(content=reply)],
+        "escalation_id": escalation_id,
+        "conversation_id": conversation_id,
+        "messages": [AIMessage(content=ESCALATION_REPLY)],
     }
 
 
@@ -210,8 +232,8 @@ async def persist_node(state: PolicyChatState) -> dict[str, Any]:
     """
     triage = state.get("triage") or {}
     async with AsyncSessionLocal() as session:
-        user = await _ensure_user(session, state)
-        conversation = await _ensure_conversation(session, state, user.id)
+        user = await ensure_user(session, state)
+        conversation = await ensure_conversation(session, state, user.id)
 
         session.add(
             Message(
@@ -248,49 +270,6 @@ async def persist_node(state: PolicyChatState) -> dict[str, Any]:
     return {"conversation_id": str(conversation.id)}
 
 
-async def _ensure_user(session, state: PolicyChatState) -> User:
-    """Get-or-create the employee row from request identifiers."""
-    employee_id = state.get("employee_id") or "anonymous"
-    result = await session.execute(
-        select(User).where(User.employee_id == employee_id)
-    )
-    user = result.scalar_one_or_none()
-    if user:
-        return user
-    user = User(
-        employee_id=employee_id,
-        name=employee_id,
-        email=f"{employee_id}@example.com",
-        role="employee",
-    )
-    # Honour an explicit UUID if the client already knows the user id.
-    if state.get("user_id"):
-        try:
-            user.id = uuid.UUID(state["user_id"])
-        except ValueError:
-            pass
-    session.add(user)
-    await session.commit()
-    await session.refresh(user)
-    return user
-
-
-async def _ensure_conversation(session, state: PolicyChatState, user_id: uuid.UUID) -> Conversation:
-    """Get-or-create the Conversation row keyed by LangGraph ``thread_id``."""
-    thread_id = state.get("thread_id") or str(uuid.uuid4())
-    result = await session.execute(
-        select(Conversation).where(Conversation.thread_id == thread_id)
-    )
-    conversation = result.scalar_one_or_none()
-    if conversation:
-        return conversation
-    conversation = Conversation(user_id=user_id, thread_id=thread_id)
-    session.add(conversation)
-    await session.commit()
-    await session.refresh(conversation)
-    return conversation
-
-
 def route_after_triage(state: PolicyChatState) -> str:
     """Conditional edge: send high-sensitivity / needs_human queries to escalate.
 
@@ -299,4 +278,4 @@ def route_after_triage(state: PolicyChatState) -> str:
     triage = state.get("triage") or {}
     if triage.get("needs_human") or triage.get("sensitivity") == "high":
         return "escalate"
-    return "retrieve"
+    return "policy_answer"
