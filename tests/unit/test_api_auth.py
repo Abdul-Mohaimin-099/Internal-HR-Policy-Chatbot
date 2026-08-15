@@ -12,6 +12,7 @@ client = TestClient(app)
 def test_root_and_health_are_public():
     assert client.get("/").status_code == 200
     assert client.get("/health").json() == {"status": "ok"}
+    assert client.get("/live").json() == {"status": "ok"}
 
 
 def test_v1_requires_api_key():

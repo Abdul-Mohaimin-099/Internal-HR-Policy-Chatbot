@@ -288,7 +288,9 @@ flowchart LR
 | `GET/POST /api/v1/documents/*` | `x-api-key` | Policy ingest / list / reindex |
 | `GET /api/v1/conversations/{user_id}` | `x-api-key` | History (includes `role=hr`) |
 | `GET/POST /api/v1/escalations/*` | `x-api-key` | HR queue + HITL actions |
-| `GET /health` | public | Liveness |
+| `GET /health` | public | Liveness (alias of `/live`) |
+| `GET /live` | public | Liveness — process up |
+| `GET /ready` | public | Readiness — Postgres + Qdrant + LLM config |
 
 There is no separate HR UI in-repo; HR tools call the escalations API (or curl).
 

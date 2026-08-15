@@ -11,11 +11,12 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 
-from fastapi import Depends, FastAPI
+from fastapi import Depends, FastAPI, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 
 from hr_chatbot.api.v1.router import router as api_v1_router
 from hr_chatbot.core.config import settings
+from hr_chatbot.core.health import readiness_payload, run_readiness_checks
 from hr_chatbot.core.logging_config import get_logger, setup_logging
 from hr_chatbot.core.security import require_api_key
 
@@ -59,9 +60,23 @@ def create_application() -> FastAPI:
         """Unauthenticated service banner for smoke checks."""
         return {"service": settings.PROJECT_NAME, "version": settings.VERSION}
 
+    @app.get("/live")
+    async def live():
+        """Liveness probe — process is up; no dependency calls."""
+        return {"status": "ok"}
+
+    @app.get("/ready")
+    async def ready(response: Response):
+        """Readiness probe — Postgres, Qdrant, and LLM config must pass."""
+        checks = await run_readiness_checks()
+        payload = readiness_payload(checks)
+        if payload["status"] != "ok":
+            response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+        return payload
+
     @app.get("/health")
     async def health():
-        """Liveness probe — extended dependency checks can be added later."""
+        """Backward-compatible alias of ``/live`` (simple ``{"status":"ok"}``)."""
         return {"status": "ok"}
 
     # Everything under /api/v1 requires the shared project API key.
